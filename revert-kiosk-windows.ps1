@@ -28,7 +28,7 @@
 # Preencha com a URL publica deste mesmo arquivo depois de hospeda-lo.
 # Usado so como fallback para reabrir elevado quando o script roda via
 # "irm | iex" (nesse modo nao existe um arquivo .ps1 em disco pra reabrir).
-$ScriptUrl = "https://SEU_LINK_AQUI/revert-kiosk-windows.ps1"
+$ScriptUrl = "https://raw.githubusercontent.com/GVNI2C/kioskControl/refs/heads/main/revert-kiosk-windows.ps1?token=GHSAT0AAAAAAEJES64BUQKGMUIGU3D5ZTV42VJYXDQ"
 
 function Test-Admin {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())

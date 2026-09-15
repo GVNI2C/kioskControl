@@ -36,7 +36,7 @@
 # Preencha com a URL publica deste mesmo arquivo depois de hospeda-lo.
 # Usado so como fallback para reabrir elevado quando o script roda via
 # "irm | iex" (nesse modo nao existe um arquivo .ps1 em disco pra reabrir).
-$ScriptUrl = "https://SEU_LINK_AQUI/deploy-kiosk-windows.ps1"
+$ScriptUrl = "https://raw.githubusercontent.com/GVNI2C/kioskControl/refs/heads/main/deploy-kiosk-windows.ps1?token=GHSAT0AAAAAAEJES64AKM5WZOPRBIASFREU2VJYT5A"
 
 # ---------------------------------------------------------------------------
 # 0. Garante que esta rodando como Administrador
