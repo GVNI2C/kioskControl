@@ -109,8 +109,14 @@ function Set-CurrentIPv4AsStatic {
     Write-Step "Convertendo o IP atual para IP fixo..."
 
     try {
-        # Usa a interface que possui a rota padrao IPv4 (normalmente a interface
-        # atualmente usada para acessar a rede/Internet).
+        # -------------------------------------------------------------------
+        # IMPORTANTE:
+        # Em algumas VMs (especialmente VMware/Hyper-V), Set-NetIPInterface
+        # pode remover o lease DHCP antes que Get-NetIPAddress consiga
+        # localiza-lo novamente. Por isso a troca final usa NETSH, que e mais
+        # tolerante nesse cenario.
+        # -------------------------------------------------------------------
+
         $defaultRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "0.0.0.0/0" |
             Where-Object { $_.NextHop -and $_.State -eq "Alive" } |
             Sort-Object RouteMetric, InterfaceMetric |
@@ -122,29 +128,57 @@ function Set-CurrentIPv4AsStatic {
 
         $interfaceIndex = $defaultRoute.InterfaceIndex
         $adapter = Get-NetAdapter -InterfaceIndex $interfaceIndex -ErrorAction Stop
+        $interfaceAlias = $adapter.Name
 
         $ipConfig = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction Stop
-        $ipv4 = $ipConfig.IPv4Address |
-            Where-Object { $_.IPAddress -notmatch '^169\.254\.' } |
-            Select-Object -First 1
+
+        $ipv4 = @(
+            $ipConfig.IPv4Address |
+                Where-Object {
+                    $_.IPAddress -notmatch '^169\.254\.' -and
+                    $_.IPAddress -ne '127.0.0.1'
+                }
+        ) | Select-Object -First 1
 
         if (-not $ipv4) {
-            throw "Nao foi encontrado um endereco IPv4 valido na interface '$($adapter.Name)'."
+            throw "Nao foi encontrado um endereco IPv4 valido na interface '$interfaceAlias'."
         }
 
         $ipAddress = $ipv4.IPAddress
         $prefixLength = [int]$ipv4.PrefixLength
-        $gateway = $ipConfig.IPv4DefaultGateway.NextHop
 
+        # Converte /XX para mascara decimal para uso com NETSH.
+        function Convert-PrefixToMask([int]$prefix) {
+            if ($prefix -lt 0 -or $prefix -gt 32) {
+                throw "Prefixo IPv4 invalido: /$prefix"
+            }
+
+            $mask = [uint32]0
+            if ($prefix -gt 0) {
+                $mask = [uint32]([math]::Pow(2, 32) - [math]::Pow(2, 32 - $prefix))
+            }
+
+            $bytes = [BitConverter]::GetBytes($mask)
+            if ([BitConverter]::IsLittleEndian) {
+                [array]::Reverse($bytes)
+            }
+
+            return ($bytes -join '.')
+        }
+
+        $subnetMask = Convert-PrefixToMask $prefixLength
+
+        $gateway = $null
+        if ($ipConfig.IPv4DefaultGateway) {
+            $gateway = $ipConfig.IPv4DefaultGateway.NextHop
+        }
         if (-not $gateway) {
             $gateway = $defaultRoute.NextHop
         }
 
-        # Preserva os DNS atualmente utilizados. Se nao houver DNS informado,
-        # usa o gateway como fallback.
         $dnsServers = @(
             (Get-DnsClientServerAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses |
-            Where-Object { $_ -and $_ -notmatch '^0\.0\.0\.0$' }
+                Where-Object { $_ -and $_ -notmatch '^0\.0\.0\.0$' }
         ) | Select-Object -Unique
 
         if (-not $dnsServers -or $dnsServers.Count -eq 0) {
@@ -153,12 +187,13 @@ function Set-CurrentIPv4AsStatic {
             }
         }
 
-        Write-Host "   Interface:   $($adapter.Name)" -ForegroundColor DarkGray
+        Write-Host "   Interface:   $interfaceAlias" -ForegroundColor DarkGray
         Write-Host "   IP atual:    $ipAddress/$prefixLength" -ForegroundColor DarkGray
+        Write-Host "   Mascara:     $subnetMask" -ForegroundColor DarkGray
         Write-Host "   Gateway:     $gateway" -ForegroundColor DarkGray
         Write-Host "   DNS:         $($dnsServers -join ', ')" -ForegroundColor DarkGray
 
-        # Salva a configuracao para facilitar diagnostico/reversao.
+        # Guarda a configuracao.
         $backupPath = "HKLM:\SOFTWARE\KioskDeploy"
         if (-not (Test-Path $backupPath)) {
             New-Item -Path $backupPath -Force | Out-Null
@@ -166,82 +201,91 @@ function Set-CurrentIPv4AsStatic {
 
         New-ItemProperty -Path $backupPath -Name "StaticIPAddress" -PropertyType String -Value $ipAddress -Force | Out-Null
         New-ItemProperty -Path $backupPath -Name "StaticPrefixLength" -PropertyType DWord -Value $prefixLength -Force | Out-Null
-        if ($gateway) {
-            New-ItemProperty -Path $backupPath -Name "StaticGateway" -PropertyType String -Value $gateway -Force | Out-Null
-        }
-        New-ItemProperty -Path $backupPath -Name "StaticInterfaceAlias" -PropertyType String -Value $adapter.Name -Force | Out-Null
+        New-ItemProperty -Path $backupPath -Name "StaticSubnetMask" -PropertyType String -Value $subnetMask -Force | Out-Null
+        New-ItemProperty -Path $backupPath -Name "StaticGateway" -PropertyType String -Value $gateway -Force | Out-Null
+        New-ItemProperty -Path $backupPath -Name "StaticInterfaceAlias" -PropertyType String -Value $interfaceAlias -Force | Out-Null
 
-        # Desativa DHCP. Algumas versoes do Windows removem o lease imediatamente,
-        # por isso a remocao do endereco atual abaixo e tolerante a ausencia.
-        Set-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
-        Start-Sleep -Milliseconds 700
+        # -------------------------------------------------------------------
+        # Faz a troca diretamente pelo NETSH.
+        # Isso evita a falha observada em VMs onde Set-NetIPInterface provoca
+        # a remocao do objeto MSFT_NetIPAddress antes da proxima consulta.
+        # -------------------------------------------------------------------
+        Write-Host "   Aplicando configuracao estatica..." -ForegroundColor DarkGray
 
-        # Remove somente o endereco que capturamos no inicio. Se o Windows ja
-        # removeu o lease durante a troca para DHCP Disabled, simplesmente segue.
-        $currentIpObjects = @(
-            Get-NetIPAddress -IPAddress $ipAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $netshArgs = @(
+            'interface', 'ipv4', 'set', 'address',
+            "name=$interfaceAlias",
+            'source=static',
+            "address=$ipAddress",
+            "mask=$subnetMask"
         )
 
-        foreach ($currentIpObject in $currentIpObjects) {
-            Remove-NetIPAddress -InputObject $currentIpObject -Confirm:$false -ErrorAction SilentlyContinue
-        }
-
-        Start-Sleep -Milliseconds 700
-
-        $newIpParams = @{
-            InterfaceIndex = $interfaceIndex
-            IPAddress      = $ipAddress
-            PrefixLength   = $prefixLength
-            AddressFamily  = "IPv4"
-            Type           = "Unicast"
-            ErrorAction    = "Stop"
-        }
-
         if ($gateway) {
-            $newIpParams["DefaultGateway"] = $gateway
+            $netshArgs += "gateway=$gateway"
+            $netshArgs += "gwmetric=1"
         }
 
-        # O Windows pode demorar um pouco para liberar o objeto antigo.
-        # Tenta criar o mesmo IP estatico algumas vezes antes de falhar.
-        $newIp = $null
-        $lastIpError = $null
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
-            try {
-                $newIp = New-NetIPAddress @newIpParams
-                break
-            } catch {
-                $lastIpError = $_.Exception.Message
-                Start-Sleep -Seconds 1
+        $netshOutput = & netsh.exe @netshArgs 2>&1
+        $netshExit = $LASTEXITCODE
+
+        if ($netshExit -ne 0) {
+            throw "NETSH nao conseguiu aplicar o IP fixo. Codigo $netshExit. $($netshOutput -join ' ')"
+        }
+
+        Start-Sleep -Seconds 2
+
+        # Define DNS preservando os servidores que estavam configurados.
+        if ($dnsServers -and $dnsServers.Count -gt 0) {
+            & netsh.exe interface ip set dns name="$interfaceAlias" source=static addr=$dnsServers[0] register=primary | Out-Null
+
+            if ($LASTEXITCODE -ne 0) {
+                throw "Nao foi possivel configurar o DNS primario."
+            }
+
+            for ($i = 1; $i -lt $dnsServers.Count; $i++) {
+                & netsh.exe interface ip add dns name="$interfaceAlias" addr=$dnsServers[$i] index=($i + 1) | Out-Null
             }
         }
 
-        if (-not $newIp) {
-            throw "Nao foi possivel recriar o IP $ipAddress como estatico: $lastIpError"
+        Start-Sleep -Seconds 2
+
+        # -------------------------------------------------------------------
+        # Validacao: nao dependemos de PrefixOrigin=Manual, pois alguns
+        # drivers virtuais retornam propriedades diferentes.
+        # -------------------------------------------------------------------
+        $finalConfig = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction Stop
+        $finalIpv4 = @(
+            $finalConfig.IPv4Address |
+                Where-Object { $_.IPAddress -eq $ipAddress }
+        ) | Select-Object -First 1
+
+        if (-not $finalIpv4) {
+            throw "O endereco $ipAddress nao apareceu novamente na interface '$interfaceAlias' apos a configuracao."
         }
 
-        if ($dnsServers -and $dnsServers.Count -gt 0) {
-            Set-DnsClientServerAddress -InterfaceIndex $interfaceIndex -ServerAddresses $dnsServers -ErrorAction Stop
-        }
+        $dhcpState = (Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
 
-        # Confirma a configuracao efetivamente aplicada.
-        Start-Sleep -Seconds 1
-        $finalIp = Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 |
-            Where-Object { $_.IPAddress -eq $ipAddress -and $_.PrefixOrigin -eq "Manual" } |
-            Select-Object -First 1
+        # Confirma tambem via netsh que a origem esta estatica.
+        $netshVerify = & netsh.exe interface ipv4 show config name="$interfaceAlias" 2>&1
+        $netshVerifyText = $netshVerify -join "`n"
 
-        if (-not $finalIp) {
-            throw "O endereco $ipAddress nao foi confirmado como estatico."
+        if ($netshVerifyText -match 'DHCP enabled:\s+Yes') {
+            throw "O Windows ainda informa DHCP habilitado na interface '$interfaceAlias'."
         }
 
         Write-Ok "IP convertido para fixo com sucesso: $ipAddress/$prefixLength"
+
         return [PSCustomObject]@{
-            InterfaceName = $adapter.Name
+            InterfaceName = $interfaceAlias
             IPAddress     = $ipAddress
             PrefixLength  = $prefixLength
+            SubnetMask    = $subnetMask
             Gateway       = $gateway
             DNSServers    = $dnsServers
+            DHCP          = $dhcpState
         }
-    } catch {
+    }
+    catch {
         Write-Fail "Nao foi possivel definir o IP atual como fixo: $($_.Exception.Message)"
         Write-Host "   O restante do deploy sera interrompido para evitar uma configuracao parcial." -ForegroundColor Red
         Exit-WithPause
