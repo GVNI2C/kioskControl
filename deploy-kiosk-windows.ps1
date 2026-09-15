@@ -23,7 +23,7 @@
     - Pede a URL do kiosk (a que voce pega no painel admin)
     - Configura o navegador para abrir em tela cheia/kiosk, sem sair
     - Trava configuracoes do navegador (extensoes, modo anonimo, etc.)
-    - Converte automaticamente o IPv4 atual (DHCP) para IP fixo, preservando IP, gateway e DNS
+    - Converte automaticamente o IPv4 atual (DHCP) para IP fixo e define DNS 8.8.8.8 e 1.1.1.1
     - Exibe no final o IP fixo definido
     - Desativa suspensao/protetor de tela
     - Configura inicializacao automatica (tarefa agendada OU substituindo
@@ -178,16 +178,8 @@ function Set-CurrentIPv4AsStatic {
             $gateway = $defaultRoute.NextHop
         }
 
-        $dnsServers = @(
-            (Get-DnsClientServerAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses |
-                Where-Object { $_ -and $_ -notmatch '^0\.0\.0\.0$' }
-        ) | Select-Object -Unique
-
-        if (-not $dnsServers -or $dnsServers.Count -eq 0) {
-            if ($gateway) {
-                $dnsServers = @($gateway)
-            }
-        }
+        # DNS padrao definido pelo deploy.
+        $dnsServers = @("8.8.8.8", "1.1.1.1")
 
         if ($Skip) {
             Write-Ok "IP mantido como esta: $ipAddress/$prefixLength"
@@ -659,6 +651,7 @@ function Main {
     }
     Write-Host "   Mascara/prefixo:  /$($staticNetwork.PrefixLength)" -ForegroundColor Cyan
     Write-Host "   Gateway:          $($staticNetwork.Gateway)" -ForegroundColor Cyan
+    Write-Host "   DNS:              8.8.8.8 / 1.1.1.1" -ForegroundColor Cyan
     Write-Host "   Interface:        $($staticNetwork.InterfaceName)" -ForegroundColor Cyan
     Write-Host "   ========================================================" -ForegroundColor Cyan
     Write-Host ""
