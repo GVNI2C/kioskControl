@@ -106,7 +106,9 @@ function Write-Fail($text) {
 # 0.1. Converte o IPv4 atual (DHCP) em IP fixo, preservando a configuracao
 # ---------------------------------------------------------------------------
 function Set-CurrentIPv4AsStatic {
-    Write-Step "Convertendo o IP atual para IP fixo..."
+    param(
+        [switch]$Skip
+    )
 
     try {
         # -------------------------------------------------------------------
@@ -187,6 +189,21 @@ function Set-CurrentIPv4AsStatic {
             }
         }
 
+        if ($Skip) {
+            Write-Ok "IP mantido como esta: $ipAddress/$prefixLength"
+
+            return [PSCustomObject]@{
+                InterfaceName = $interfaceAlias
+                IPAddress     = $ipAddress
+                PrefixLength  = $prefixLength
+                SubnetMask    = $subnetMask
+                Gateway       = $gateway
+                DNSServers    = $dnsServers
+                DHCP          = "Mantido"
+            }
+        }
+
+        Write-Step "Convertendo o IP atual para IP fixo..."
         Write-Host "   Interface:   $interfaceAlias" -ForegroundColor DarkGray
         Write-Host "   IP atual:    $ipAddress/$prefixLength" -ForegroundColor DarkGray
         Write-Host "   Mascara:     $subnetMask" -ForegroundColor DarkGray
@@ -247,30 +264,49 @@ function Set-CurrentIPv4AsStatic {
             }
         }
 
-        Start-Sleep -Seconds 2
-
         # -------------------------------------------------------------------
-        # Validacao: nao dependemos de PrefixOrigin=Manual, pois alguns
-        # drivers virtuais retornam propriedades diferentes.
+        # A interface pode levar alguns segundos para voltar depois da troca.
+        # Nao encerramos o deploy nesse intervalo: aguardamos ate 60 segundos.
+        # Isso e especialmente importante em VMware/Hyper-V/VirtualBox.
         # -------------------------------------------------------------------
-        $finalConfig = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction Stop
-        $finalIpv4 = @(
-            $finalConfig.IPv4Address |
-                Where-Object { $_.IPAddress -eq $ipAddress }
-        ) | Select-Object -First 1
+        Write-Host "   Aguardando a interface de rede voltar..." -ForegroundColor DarkGray
 
-        if (-not $finalIpv4) {
-            throw "O endereco $ipAddress nao apareceu novamente na interface '$interfaceAlias' apos a configuracao."
+        $finalIpv4 = $null
+        $dhcpState = $null
+        $netshVerifyText = ""
+        $networkReady = $false
+
+        for ($attempt = 1; $attempt -le 30; $attempt++) {
+            Start-Sleep -Seconds 2
+
+            try {
+                $finalConfig = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction SilentlyContinue
+
+                if ($finalConfig) {
+                    $finalIpv4 = @(
+                        $finalConfig.IPv4Address |
+                            Where-Object { $_.IPAddress -eq $ipAddress }
+                    ) | Select-Object -First 1
+                }
+
+                $dhcpState = (Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
+
+                $netshVerify = & netsh.exe interface ipv4 show config name="$interfaceAlias" 2>&1
+                $netshVerifyText = $netshVerify -join "`n"
+
+                if ($finalIpv4 -and $netshVerifyText -notmatch 'DHCP enabled:\s+Yes') {
+                    $networkReady = $true
+                    break
+                }
+            } catch {
+                # A interface ainda esta sendo reinicializada. Continua aguardando.
+            }
+
+            Write-Host "   Aguardando rede... ($($attempt * 2)s)" -ForegroundColor DarkGray
         }
 
-        $dhcpState = (Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
-
-        # Confirma tambem via netsh que a origem esta estatica.
-        $netshVerify = & netsh.exe interface ipv4 show config name="$interfaceAlias" 2>&1
-        $netshVerifyText = $netshVerify -join "`n"
-
-        if ($netshVerifyText -match 'DHCP enabled:\s+Yes') {
-            throw "O Windows ainda informa DHCP habilitado na interface '$interfaceAlias'."
+        if (-not $networkReady) {
+            throw "A rede nao estabilizou dentro de 60 segundos apos definir o IP fixo."
         }
 
         Write-Ok "IP convertido para fixo com sucesso: $ipAddress/$prefixLength"
@@ -570,8 +606,25 @@ function Main {
     $browser = Select-Browser
     $browserPath = Get-BrowserPath -Browser $browser
 
-    # O endereco IPv4 atualmente em uso passa a ser fixo automaticamente.
-    $staticNetwork = Set-CurrentIPv4AsStatic
+    # -----------------------------------------------------------------------
+    # Opcao de IP fixo
+    # -----------------------------------------------------------------------
+    Write-Host ""
+    Write-Host "Configuracao de rede" -ForegroundColor Cyan
+    Write-Host "O IP atualmente utilizado pode ser transformado em IP fixo."
+    Write-Host "Se escolher NAO, a configuracao de rede sera mantida como esta."
+    Write-Host ""
+    Write-Host "  [1] Definir o IP atual como fixo"
+    Write-Host "  [2] Manter a configuracao atual"
+    do {
+        $networkChoice = Read-Host "Digite o numero da opcao"
+    } while ($networkChoice -notin @("1", "2"))
+
+    if ($networkChoice -eq "1") {
+        $staticNetwork = Set-CurrentIPv4AsStatic
+    } else {
+        $staticNetwork = Set-CurrentIPv4AsStatic -Skip
+    }
 
     $url = Get-KioskUrl
     Write-Ok "URL configurada: $url"
@@ -598,7 +651,12 @@ function Main {
     Write-Host "   Inicializacao: $(if ($mode -eq 'shell') {'Shell substituido (sem area de trabalho)'} else {'Tarefa agendada no login'})"
     Write-Host ""
     Write-Host "   ========================================================" -ForegroundColor Cyan
-    Write-Host "   IP FIXO DEFINIDO: $($staticNetwork.IPAddress)" -ForegroundColor Cyan
+    if ($networkChoice -eq "1") {
+        Write-Host "   IP FIXO DEFINIDO: $($staticNetwork.IPAddress)" -ForegroundColor Cyan
+    } else {
+        Write-Host "   IP ATUAL:         $($staticNetwork.IPAddress)" -ForegroundColor Cyan
+        Write-Host "   IP FIXO:          NAO ALTERADO" -ForegroundColor Cyan
+    }
     Write-Host "   Mascara/prefixo:  /$($staticNetwork.PrefixLength)" -ForegroundColor Cyan
     Write-Host "   Gateway:          $($staticNetwork.Gateway)" -ForegroundColor Cyan
     Write-Host "   Interface:        $($staticNetwork.InterfaceName)" -ForegroundColor Cyan
@@ -607,6 +665,8 @@ function Main {
     Write-Host "   Para desfazer tudo isso depois, use revert-kiosk-windows.ps1" -ForegroundColor DarkGray
     Write-Host ""
 
+    Write-Host "IP atual da maquina: $($staticNetwork.IPAddress)" -ForegroundColor Green
+    Write-Host ""
     $reboot = Read-Host "Deseja reiniciar o computador agora para aplicar tudo? (S/N)"
     if ($reboot -match '^[Ss]') {
         Write-Host "Reiniciando em 5 segundos..." -ForegroundColor Yellow
