@@ -243,18 +243,54 @@ function Set-CurrentIPv4AsStatic {
 
         Start-Sleep -Seconds 2
 
-        # Define DNS preservando os servidores que estavam configurados.
-        if ($dnsServers -and $dnsServers.Count -gt 0) {
-            & netsh.exe interface ip set dns name="$interfaceAlias" source=static addr=$dnsServers[0] register=primary | Out-Null
+        # -------------------------------------------------------------------
+        # Configura DNS depois que o IP foi aplicado.
+        #
+        # Nao usamos "netsh interface ip set dns" aqui porque em algumas
+        # versoes do Windows/VM ele retorna erro mesmo quando a interface
+        # acabou de ser recriada. O cmdlet Set-DnsClientServerAddress e mais
+        # confiavel para esse caso. Se ele falhar, fazemos fallback para
+        # NETSH e continuamos tentando enquanto a interface estabiliza.
+        # -------------------------------------------------------------------
+        $dnsConfigured = $false
 
-            if ($LASTEXITCODE -ne 0) {
-                throw "Nao foi possivel configurar o DNS primario."
-            }
+        for ($dnsAttempt = 1; $dnsAttempt -le 15; $dnsAttempt++) {
+            try {
+                Set-DnsClientServerAddress `
+                    -InterfaceIndex $interfaceIndex `
+                    -ServerAddresses $dnsServers `
+                    -ErrorAction Stop
 
-            for ($i = 1; $i -lt $dnsServers.Count; $i++) {
-                & netsh.exe interface ip add dns name="$interfaceAlias" addr=$dnsServers[$i] index=($i + 1) | Out-Null
+                $dnsConfigured = $true
+                break
+            } catch {
+                Write-Host "   Aguardando interface para configurar DNS... ($($dnsAttempt * 2)s)" -ForegroundColor DarkGray
+                Start-Sleep -Seconds 2
             }
         }
+
+        # Fallback para NETSH caso o cmdlet ainda nao consiga configurar.
+        if (-not $dnsConfigured) {
+            try {
+                & netsh.exe interface ipv4 set dnsservers name="$interfaceAlias" source=static address=$dnsServers[0] validate=no | Out-Null
+
+                if ($LASTEXITCODE -eq 0) {
+                    for ($i = 1; $i -lt $dnsServers.Count; $i++) {
+                        & netsh.exe interface ipv4 add dnsservers name="$interfaceAlias" address=$dnsServers[$i] index=($i + 1) validate=no | Out-Null
+                    }
+
+                    $dnsConfigured = ($LASTEXITCODE -eq 0)
+                }
+            } catch {
+                $dnsConfigured = $false
+            }
+        }
+
+        if (-not $dnsConfigured) {
+            throw "Nao foi possivel configurar os DNS 8.8.8.8 e 1.1.1.1 apos varias tentativas."
+        }
+
+        Write-Ok "DNS configurados: 8.8.8.8 e 1.1.1.1"
 
         # -------------------------------------------------------------------
         # A interface pode levar alguns segundos para voltar depois da troca.
@@ -283,10 +319,16 @@ function Set-CurrentIPv4AsStatic {
 
                 $dhcpState = (Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
 
+                $dnsVerify = @(
+                    (Get-DnsClientServerAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+                )
+
                 $netshVerify = & netsh.exe interface ipv4 show config name="$interfaceAlias" 2>&1
                 $netshVerifyText = $netshVerify -join "`n"
 
-                if ($finalIpv4 -and $netshVerifyText -notmatch 'DHCP enabled:\s+Yes') {
+                $dnsOk = ($dnsVerify -contains "8.8.8.8") -and ($dnsVerify -contains "1.1.1.1")
+
+                if ($finalIpv4 -and $netshVerifyText -notmatch 'DHCP enabled:\s+Yes' -and $dnsOk) {
                     $networkReady = $true
                     break
                 }
