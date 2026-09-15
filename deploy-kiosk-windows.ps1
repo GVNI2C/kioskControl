@@ -77,7 +77,7 @@ $ErrorActionPreference = "Stop"
 function Show-Banner {
     Clear-Host
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "   KIOSK DEPLOY - Configurador automatico de TV (Windows)  " -ForegroundColor Cyan
+    Write-Host "   KIOSK DEPLOY - Configurador automatico de TV (Windows) - revisão 1.0 " -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
 }
