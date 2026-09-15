@@ -171,14 +171,22 @@ function Set-CurrentIPv4AsStatic {
         }
         New-ItemProperty -Path $backupPath -Name "StaticInterfaceAlias" -PropertyType String -Value $adapter.Name -Force | Out-Null
 
-        # Desativa DHCP na interface.
+        # Desativa DHCP. Algumas versoes do Windows removem o lease imediatamente,
+        # por isso a remocao do endereco atual abaixo e tolerante a ausencia.
         Set-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+        Start-Sleep -Milliseconds 700
 
-        # Remove somente o IPv4 atual. Em seguida recria o MESMO endereco como
-        # estatico, mantendo prefixo e gateway.
-        Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 |
-            Where-Object { $_.IPAddress -eq $ipAddress } |
-            Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+        # Remove somente o endereco que capturamos no inicio. Se o Windows ja
+        # removeu o lease durante a troca para DHCP Disabled, simplesmente segue.
+        $currentIpObjects = @(
+            Get-NetIPAddress -IPAddress $ipAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        )
+
+        foreach ($currentIpObject in $currentIpObjects) {
+            Remove-NetIPAddress -InputObject $currentIpObject -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
+        Start-Sleep -Milliseconds 700
 
         $newIpParams = @{
             InterfaceIndex = $interfaceIndex
@@ -193,7 +201,23 @@ function Set-CurrentIPv4AsStatic {
             $newIpParams["DefaultGateway"] = $gateway
         }
 
-        New-NetIPAddress @newIpParams | Out-Null
+        # O Windows pode demorar um pouco para liberar o objeto antigo.
+        # Tenta criar o mesmo IP estatico algumas vezes antes de falhar.
+        $newIp = $null
+        $lastIpError = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                $newIp = New-NetIPAddress @newIpParams
+                break
+            } catch {
+                $lastIpError = $_.Exception.Message
+                Start-Sleep -Seconds 1
+            }
+        }
+
+        if (-not $newIp) {
+            throw "Nao foi possivel recriar o IP $ipAddress como estatico: $lastIpError"
+        }
 
         if ($dnsServers -and $dnsServers.Count -gt 0) {
             Set-DnsClientServerAddress -InterfaceIndex $interfaceIndex -ServerAddresses $dnsServers -ErrorAction Stop
