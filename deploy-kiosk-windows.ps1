@@ -23,6 +23,8 @@
     - Pede a URL do kiosk (a que voce pega no painel admin)
     - Configura o navegador para abrir em tela cheia/kiosk, sem sair
     - Trava configuracoes do navegador (extensoes, modo anonimo, etc.)
+    - Converte automaticamente o IPv4 atual (DHCP) para IP fixo, preservando IP, gateway e DNS
+    - Exibe no final o IP fixo definido
     - Desativa suspensao/protetor de tela
     - Configura inicializacao automatica (tarefa agendada OU substituindo
       o shell do Windows, para nunca mostrar a area de trabalho)
@@ -98,6 +100,128 @@ function Exit-WithPause {
 
 function Write-Fail($text) {
     Write-Host "   [ERRO] $text" -ForegroundColor Red
+}
+
+# ---------------------------------------------------------------------------
+# 0.1. Converte o IPv4 atual (DHCP) em IP fixo, preservando a configuracao
+# ---------------------------------------------------------------------------
+function Set-CurrentIPv4AsStatic {
+    Write-Step "Convertendo o IP atual para IP fixo..."
+
+    try {
+        # Usa a interface que possui a rota padrao IPv4 (normalmente a interface
+        # atualmente usada para acessar a rede/Internet).
+        $defaultRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "0.0.0.0/0" |
+            Where-Object { $_.NextHop -and $_.State -eq "Alive" } |
+            Sort-Object RouteMetric, InterfaceMetric |
+            Select-Object -First 1
+
+        if (-not $defaultRoute) {
+            throw "Nao foi encontrada uma rota padrao IPv4."
+        }
+
+        $interfaceIndex = $defaultRoute.InterfaceIndex
+        $adapter = Get-NetAdapter -InterfaceIndex $interfaceIndex -ErrorAction Stop
+
+        $ipConfig = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction Stop
+        $ipv4 = $ipConfig.IPv4Address |
+            Where-Object { $_.IPAddress -notmatch '^169\.254\.' } |
+            Select-Object -First 1
+
+        if (-not $ipv4) {
+            throw "Nao foi encontrado um endereco IPv4 valido na interface '$($adapter.Name)'."
+        }
+
+        $ipAddress = $ipv4.IPAddress
+        $prefixLength = [int]$ipv4.PrefixLength
+        $gateway = $ipConfig.IPv4DefaultGateway.NextHop
+
+        if (-not $gateway) {
+            $gateway = $defaultRoute.NextHop
+        }
+
+        # Preserva os DNS atualmente utilizados. Se nao houver DNS informado,
+        # usa o gateway como fallback.
+        $dnsServers = @(
+            (Get-DnsClientServerAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses |
+            Where-Object { $_ -and $_ -notmatch '^0\.0\.0\.0$' }
+        ) | Select-Object -Unique
+
+        if (-not $dnsServers -or $dnsServers.Count -eq 0) {
+            if ($gateway) {
+                $dnsServers = @($gateway)
+            }
+        }
+
+        Write-Host "   Interface:   $($adapter.Name)" -ForegroundColor DarkGray
+        Write-Host "   IP atual:    $ipAddress/$prefixLength" -ForegroundColor DarkGray
+        Write-Host "   Gateway:     $gateway" -ForegroundColor DarkGray
+        Write-Host "   DNS:         $($dnsServers -join ', ')" -ForegroundColor DarkGray
+
+        # Salva a configuracao para facilitar diagnostico/reversao.
+        $backupPath = "HKLM:\SOFTWARE\KioskDeploy"
+        if (-not (Test-Path $backupPath)) {
+            New-Item -Path $backupPath -Force | Out-Null
+        }
+
+        New-ItemProperty -Path $backupPath -Name "StaticIPAddress" -PropertyType String -Value $ipAddress -Force | Out-Null
+        New-ItemProperty -Path $backupPath -Name "StaticPrefixLength" -PropertyType DWord -Value $prefixLength -Force | Out-Null
+        if ($gateway) {
+            New-ItemProperty -Path $backupPath -Name "StaticGateway" -PropertyType String -Value $gateway -Force | Out-Null
+        }
+        New-ItemProperty -Path $backupPath -Name "StaticInterfaceAlias" -PropertyType String -Value $adapter.Name -Force | Out-Null
+
+        # Desativa DHCP na interface.
+        Set-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+
+        # Remove somente o IPv4 atual. Em seguida recria o MESMO endereco como
+        # estatico, mantendo prefixo e gateway.
+        Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 |
+            Where-Object { $_.IPAddress -eq $ipAddress } |
+            Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+
+        $newIpParams = @{
+            InterfaceIndex = $interfaceIndex
+            IPAddress      = $ipAddress
+            PrefixLength   = $prefixLength
+            AddressFamily  = "IPv4"
+            Type           = "Unicast"
+            ErrorAction    = "Stop"
+        }
+
+        if ($gateway) {
+            $newIpParams["DefaultGateway"] = $gateway
+        }
+
+        New-NetIPAddress @newIpParams | Out-Null
+
+        if ($dnsServers -and $dnsServers.Count -gt 0) {
+            Set-DnsClientServerAddress -InterfaceIndex $interfaceIndex -ServerAddresses $dnsServers -ErrorAction Stop
+        }
+
+        # Confirma a configuracao efetivamente aplicada.
+        Start-Sleep -Seconds 1
+        $finalIp = Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 |
+            Where-Object { $_.IPAddress -eq $ipAddress -and $_.PrefixOrigin -eq "Manual" } |
+            Select-Object -First 1
+
+        if (-not $finalIp) {
+            throw "O endereco $ipAddress nao foi confirmado como estatico."
+        }
+
+        Write-Ok "IP convertido para fixo com sucesso: $ipAddress/$prefixLength"
+        return [PSCustomObject]@{
+            InterfaceName = $adapter.Name
+            IPAddress     = $ipAddress
+            PrefixLength  = $prefixLength
+            Gateway       = $gateway
+            DNSServers    = $dnsServers
+        }
+    } catch {
+        Write-Fail "Nao foi possivel definir o IP atual como fixo: $($_.Exception.Message)"
+        Write-Host "   O restante do deploy sera interrompido para evitar uma configuracao parcial." -ForegroundColor Red
+        Exit-WithPause
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -378,6 +502,9 @@ function Main {
     $browser = Select-Browser
     $browserPath = Get-BrowserPath -Browser $browser
 
+    # O endereco IPv4 atualmente em uso passa a ser fixo automaticamente.
+    $staticNetwork = Set-CurrentIPv4AsStatic
+
     $url = Get-KioskUrl
     Write-Ok "URL configurada: $url"
 
@@ -401,6 +528,13 @@ function Main {
     Write-Host "   Navegador:    $(if ($browser -eq 'chrome') {'Google Chrome'} else {'Microsoft Edge'})"
     Write-Host "   URL:          $url"
     Write-Host "   Inicializacao: $(if ($mode -eq 'shell') {'Shell substituido (sem area de trabalho)'} else {'Tarefa agendada no login'})"
+    Write-Host ""
+    Write-Host "   ========================================================" -ForegroundColor Cyan
+    Write-Host "   IP FIXO DEFINIDO: $($staticNetwork.IPAddress)" -ForegroundColor Cyan
+    Write-Host "   Mascara/prefixo:  /$($staticNetwork.PrefixLength)" -ForegroundColor Cyan
+    Write-Host "   Gateway:          $($staticNetwork.Gateway)" -ForegroundColor Cyan
+    Write-Host "   Interface:        $($staticNetwork.InterfaceName)" -ForegroundColor Cyan
+    Write-Host "   ========================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "   Para desfazer tudo isso depois, use revert-kiosk-windows.ps1" -ForegroundColor DarkGray
     Write-Host ""
