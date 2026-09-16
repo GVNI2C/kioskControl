@@ -54,10 +54,99 @@ if (-not (Test-Admin)) {
 }
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "   REVERT KIOSK - restaurando o Windows ao normal            " -ForegroundColor Cyan
+Write-Host "   REVERT KIOSK - restaurando o Windows ao normal - revisão 1.0 " -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
-# 1. Restaura o shell original, se foi substituido
+# 1. Restaura a configuracao de rede alterada pelo deploy
+#    Se o deploy transformou o IP atual em fixo, o revert devolve:
+#      - IPv4 para DHCP
+#      - DNS para obtencao automatica
+#    Se o usuario escolheu "Manter a configuracao atual" no deploy, a chave
+#    StaticIPAddress nao existe e a rede nao e alterada aqui.
+$winlogonPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+$backupPath = "HKLM:\SOFTWARE\KioskDeploy"
+
+$staticIPAddress = (Get-ItemProperty -Path $backupPath -Name "StaticIPAddress" -ErrorAction SilentlyContinue).StaticIPAddress
+$staticInterfaceAlias = (Get-ItemProperty -Path $backupPath -Name "StaticInterfaceAlias" -ErrorAction SilentlyContinue).StaticInterfaceAlias
+
+if ($staticIPAddress -and $staticInterfaceAlias) {
+    Write-Host ""
+    Write-Host ">> Restaurando configuracao de rede..." -ForegroundColor Yellow
+    Write-Host "   Interface: $staticInterfaceAlias" -ForegroundColor DarkGray
+    Write-Host "   IP que estava fixo: $staticIPAddress" -ForegroundColor DarkGray
+
+    try {
+        $adapter = Get-NetAdapter -Name $staticInterfaceAlias -ErrorAction Stop
+
+        # Primeiro habilita DHCP para IPv4.
+        Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+
+        # Remove enderecos IPv4 manuais que possam ter sido deixados pelo deploy.
+        Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.PrefixOrigin -eq "Manual" -and
+                $_.IPAddress -notlike "169.254.*" -and
+                $_.IPAddress -ne "127.0.0.1"
+            } |
+            Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+
+        # Volta o DNS para obtencao automatica pelo DHCP.
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ResetServerAddresses -ErrorAction Stop
+
+        # Aguarda o DHCP devolver um endereco. Nao encerra enquanto a VM
+        # estiver apenas reinicializando a interface.
+        Write-Host "   Aguardando o DHCP fornecer um novo IP..." -ForegroundColor DarkGray
+
+        $currentIPv4 = $null
+        for ($attempt = 1; $attempt -le 30; $attempt++) {
+            Start-Sleep -Seconds 2
+
+            try {
+                $currentIPv4 = Get-NetIPAddress `
+                    -InterfaceIndex $adapter.ifIndex `
+                    -AddressFamily IPv4 `
+                    -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.IPAddress -notlike "169.254.*" -and
+                        $_.IPAddress -ne "127.0.0.1"
+                    } |
+                    Select-Object -First 1
+
+                if ($currentIPv4) {
+                    break
+                }
+            } catch {
+                # Interface ainda reiniciando; continua aguardando.
+            }
+
+            Write-Host "   Aguardando DHCP... ($($attempt * 2)s)" -ForegroundColor DarkGray
+        }
+
+        if ($currentIPv4) {
+            Write-Host "[OK] Rede restaurada para DHCP." -ForegroundColor Green
+            Write-Host "     IP atual obtido: $($currentIPv4.IPAddress)" -ForegroundColor Green
+        } else {
+            Write-Host "[AVISO] DHCP foi habilitado, mas nenhum IPv4 foi obtido em 60 segundos." -ForegroundColor Yellow
+            Write-Host "        Verifique a conectividade da rede apos o reinicio." -ForegroundColor Yellow
+        }
+
+        # Confirma que o DNS voltou para automatico.
+        $dnsServers = (Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+        if (-not $dnsServers -or $dnsServers.Count -eq 0) {
+            Write-Host "[OK] DNS configurado para obtencao automatica." -ForegroundColor Green
+        } else {
+            Write-Host "[OK] DNS atual fornecido/configurado na interface: $($dnsServers -join ', ')" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "[ERRO] Falha ao restaurar a rede: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "       O restante da reversao continuara." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host ""
+    Write-Host "[..] Nenhuma alteracao de IP fixo do deploy encontrada; rede mantida." -ForegroundColor DarkGray
+}
+
+# 2. Restaura o shell original, se foi substituido
 $winlogonPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 $backupPath = "HKLM:\SOFTWARE\KioskDeploy"
 
@@ -76,7 +165,7 @@ if (Test-Path $wrapperPath) {
     Write-Host "[OK] Script de shell do kiosk removido." -ForegroundColor Green
 }
 
-# 2. Remove a tarefa agendada, se existir
+# 3. Remove a tarefa agendada, se existir
 $taskName = "KioskBrowserStartup"
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
@@ -85,7 +174,7 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Write-Host "[..] Nenhuma tarefa agendada de kiosk encontrada." -ForegroundColor DarkGray
 }
 
-# 3. Remove as politicas de bloqueio do Chrome e do Edge
+# 4. Remove as politicas de bloqueio do Chrome e do Edge
 foreach ($regPath in @("HKLM:\SOFTWARE\Policies\Google\Chrome", "HKLM:\SOFTWARE\Policies\Microsoft\Edge")) {
     if (Test-Path $regPath) {
         Remove-Item -Path $regPath -Recurse -Force
@@ -93,7 +182,7 @@ foreach ($regPath in @("HKLM:\SOFTWARE\Policies\Google\Chrome", "HKLM:\SOFTWARE\
     }
 }
 
-# 4. Limpa a chave de backup
+# 5. Limpa a chave de backup
 if (Test-Path $backupPath) {
     Remove-Item -Path $backupPath -Recurse -Force
 }
@@ -102,9 +191,11 @@ Write-Host ""
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host "   Reversao concluida!                                      " -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green
-Write-Host "   (As configuracoes de energia/protetor de tela nao foram"
-Write-Host "    revertidas automaticamente - ajuste manualmente em"
-Write-Host "    Configuracoes > Energia, se precisar)"
+Write-Host "   Rede: DHCP restaurado e DNS em obtencao automatica (quando o deploy"
+Write-Host "         alterou o IP para fixo)."
+Write-Host "   As configuracoes de energia/protetor de tela nao sao revertidas"
+Write-Host "   automaticamente - ajuste manualmente em Configuracoes > Energia,"
+Write-Host "   se precisar."
 Write-Host ""
 
 $reboot = Read-Host "Deseja reiniciar o computador agora? (S/N)"
