@@ -1,0 +1,3 @@
+Deploy: irm https://raw.githubusercontent.com/GVNI2C/kioskControl/main/deploy-kiosk-windows.ps1 | iex
+
+Revert:	irm https://raw.githubusercontent.com/GVNI2C/kioskControl/main/revert-kiosk-windows.ps1 | iex
