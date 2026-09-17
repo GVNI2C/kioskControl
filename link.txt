@@ -1,3 +1,13 @@
+>>>>>>>>>>> WINDOWS
+
 Deploy: irm https://raw.githubusercontent.com/GVNI2C/kioskControl/main/deploy-kiosk-windows.ps1 | iex
 
 Revert:	irm https://raw.githubusercontent.com/GVNI2C/kioskControl/main/revert-kiosk-windows.ps1 | iex
+
+
+
+>>>>>>>>>>> LINUX
+
+Deploy: curl -fsSL https://raw.githubusercontent.com/GVNI2C/kioskControl/refs/heads/main/deploy-kiosk-linux.sh | sudo bash
+
+Deploy: curl -fsSL https://raw.githubusercontent.com/GVNI2C/kioskControl/refs/heads/main/revert-kiosk-linux.sh | sudo bash
